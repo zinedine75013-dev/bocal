@@ -3,11 +3,15 @@
  *
  * Un conteneur n'est qu'un processus Linux ordinaire, lancé dans de
  * nouveaux "namespaces" : des vues privées sur certaines ressources du
- * système. Pour l'instant, Bocal en utilise trois :
+ * système. Bocal en utilise trois :
  *
  *   CLONE_NEWPID  numéros de processus : le conteneur démarre au PID 1
  *   CLONE_NEWUTS  nom d'hôte : le conteneur peut changer le sien
  *   CLONE_NEWNS   points de montage : ce qu'il monte reste chez lui
+ *
+ * Grâce à son namespace de montage, le conteneur peut ensuite changer de
+ * racine : le dossier d'une image (Alpine) devient son "/", et il ne voit
+ * plus aucun fichier de l'hôte.
  */
 #include <errno.h>
 #include <sched.h>
@@ -17,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -24,6 +29,67 @@
 
 /* Taille de la pile du processus enfant : clone() ne la crée pas pour nous. */
 #define STACK_SIZE (1024 * 1024)
+
+/*
+ * Fait du dossier de l'image la racine "/" du conteneur, puis lui monte un
+ * /proc neuf. Appelée par l'enfant, déjà dans ses nouveaux namespaces.
+ * Renvoie 0, ou -1 en cas d'erreur.
+ */
+static int enter_rootfs(const char *rootfs)
+{
+    /* pivot_root() exige que la nouvelle racine soit un point de montage,
+       ce que le dossier de l'image n'est pas. On le monte donc sur
+       lui-même (bind mount). Ce montage n'existe que dans le conteneur. */
+    if (mount(rootfs, rootfs, NULL, MS_BIND | MS_REC, NULL) == -1) {
+        perror("bocal: mount (image)");
+        return -1;
+    }
+
+    /* On se place dans l'image. C'est fait après le montage, pour que le
+       dossier courant soit le point de montage lui-même, et non le
+       dossier qu'il recouvre. */
+    if (chdir(rootfs) == -1) {
+        perror("bocal: chdir (image)");
+        return -1;
+    }
+
+    /* pivot_root(nouvelle, ancienne) fait de "nouvelle" la racine, et
+       range l'ancienne racine (celle de l'hôte) dans le dossier
+       "ancienne". Avec "." pour les deux, l'ancienne racine est empilée
+       par-dessus la nouvelle, sans dossier temporaire à créer : c'est
+       l'astuce décrite dans man 2 pivot_root, et utilisée par runc.
+       La glibc n'a pas de fonction pivot_root() : on fait l'appel
+       système directement, avec syscall(). */
+    if (syscall(SYS_pivot_root, ".", ".") == -1) {
+        perror("bocal: pivot_root");
+        return -1;
+    }
+
+    /* On décroche l'ancienne racine, empilée sur "." : il ne reste plus
+       que l'image, et aucun fichier de l'hôte n'est accessible.
+       MNT_DETACH la détache même si elle est encore utilisée, par
+       exemple par le terminal, qui reste ouvert sur l'hôte. */
+    if (umount2(".", MNT_DETACH) == -1) {
+        perror("bocal: umount2 (ancienne racine)");
+        return -1;
+    }
+
+    if (chdir("/") == -1) {
+        perror("bocal: chdir");
+        return -1;
+    }
+
+    /* ps et top lisent /proc. Un /proc monté depuis le conteneur ne
+       montre que les processus de son namespace PID.
+       NOSUID, NODEV, NOEXEC : les options de sécurité habituelles. */
+    if (mount("proc", "/proc", "proc",
+              MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) == -1) {
+        perror("bocal: mount /proc");
+        return -1;
+    }
+
+    return 0;
+}
 
 /*
  * Code exécuté par le processus enfant, déjà à l'intérieur des nouveaux
@@ -56,8 +122,13 @@ static int child_main(void *arg)
         return 1;
     }
 
+    /* Le dossier de l'image devient la racine du conteneur. */
+    if (enter_rootfs(cfg->rootfs) == -1)
+        return 1;
+
     /* execvp() remplace le programme du processus sans changer son PID :
-       la commande devient donc le PID 1 du conteneur. */
+       la commande, cherchée dans l'image, devient donc le PID 1 du
+       conteneur. */
     execvp(cfg->argv[0], cfg->argv);
 
     /* On n'arrive ici que si execvp() a échoué. */

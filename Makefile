@@ -14,8 +14,12 @@ bocal: $(OBJ)
 src/%.o: src/%.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Image Alpine minimale, téléchargée une seule fois dans ./alpine.
+alpine:
+	sh scripts/alpine.sh
+
 # Les tests créent des namespaces : le script se relance avec sudo si besoin.
-test: bocal
+test: bocal alpine
 	sh tests/run.sh
 
 clean:

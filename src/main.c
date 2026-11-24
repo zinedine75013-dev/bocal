@@ -1,29 +1,31 @@
 /*
  * main.c : ligne de commande de Bocal.
  *
- *   bocal run [options] <commande> [arguments...]
+ *   bocal run [options] <image> <commande> [arguments...]
  */
 #include <getopt.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "container.h"
 
 static void usage(FILE *out)
 {
     fprintf(out,
-        "Usage : bocal run [options] <commande> [arguments...]\n"
+        "Usage : bocal run [options] <image> <commande> [arguments...]\n"
         "\n"
         "Lance <commande> dans un conteneur isolé (nouveaux namespaces PID,\n"
-        "UTS et montage). Nécessite les droits root.\n"
+        "UTS et montage), dont la racine est le dossier <image>.\n"
+        "Nécessite les droits root.\n"
         "\n"
         "Options :\n"
         "  -n, --hostname NOM   nom d'hôte du conteneur (par défaut : bocal)\n"
         "  -h, --help           affiche cette aide\n"
         "\n"
         "Exemple :\n"
-        "  sudo ./bocal run --hostname demo /bin/sh\n");
+        "  sudo ./bocal run ./alpine /bin/sh\n");
 }
 
 static int cmd_run(int argc, char **argv)
@@ -65,13 +67,23 @@ static int cmd_run(int argc, char **argv)
         }
     }
 
-    if (optind >= argc) {
-        fprintf(stderr, "bocal: il manque la commande à lancer\n\n");
+    if (argc - optind < 2) {
+        fprintf(stderr, "bocal: il faut une image et une commande\n\n");
         usage(stderr);
         return 2;
     }
 
-    cfg.argv = &argv[optind];
+    /* L'image doit être un dossier, par exemple ./alpine (make alpine). */
+    struct stat st;
+    if (stat(argv[optind], &st) == -1 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "bocal: %s n'est pas un dossier d'image\n"
+                        "Pour télécharger Alpine : make alpine\n",
+                argv[optind]);
+        return 1;
+    }
+
+    cfg.rootfs = argv[optind];
+    cfg.argv = &argv[optind + 1];
     int ret = container_run(&cfg);
     return ret < 0 ? 1 : ret;
 }
