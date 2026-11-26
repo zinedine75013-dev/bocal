@@ -65,8 +65,8 @@ check "les fichiers de l'hôte sont inaccessibles" non "$vu"
 
 # Si l'ancienne racine n'était pas démontée, les montages de l'hôte
 # apparaîtraient aussi dans cette liste.
-check "le conteneur ne voit que ses montages (/ et /proc)" \
-      2 "$($BOCAL run $IMG cat /proc/mounts | wc -l)"
+check "le conteneur ne voit que ses montages (/, /proc et /dev)" \
+      3 "$($BOCAL run $IMG cat /proc/mounts | wc -l)"
 
 # Sortie de ps : une ligne d'en-tête, puis une ligne par processus. Le
 # seul processus visible doit être ps lui-même.
@@ -124,6 +124,34 @@ limite=$(( (t2 - t1) / 1000000 ))
 if [ "$limite" -gt $((2 * libre)) ]; then ralenti=oui; else ralenti=non; fi
 check "--cpus 0.25 : le même calcul est plus lent ($libre ms, puis $limite ms)" \
       oui "$ralenti"
+
+echo
+echo "Semaine 4 : /dev et réseau"
+
+check "/dev contient les fichiers spéciaux de base" oui \
+      "$($BOCAL run $IMG sh -c '[ -c /dev/null ] && [ -c /dev/zero ] &&
+                                [ -c /dev/urandom ] && [ -c /dev/tty ] && echo oui')"
+
+check "/dev/urandom fournit des octets aléatoires" 16 \
+      "$($BOCAL run $IMG sh -c 'head -c 16 /dev/urandom | wc -c' | tr -d ' ')"
+
+# Dans un script, sh branche l'entrée d'une tâche de fond sur /dev/null :
+# sans lui, il affiche une erreur.
+check "une tâche de fond (&) se lance sans erreur dans un script" ok \
+      "$($BOCAL run $IMG sh -c 'sleep 0 & wait; echo ok' 2>&1)"
+
+if [ -z "$(ls -A $IMG/dev)" ]; then vide=oui; else vide=non; fi
+check "le /dev du conteneur n'est pas écrit dans l'image" oui "$vide"
+
+# /proc/net/dev : deux lignes d'en-tête, puis une ligne par interface.
+# paste les met bout à bout, séparées par des virgules.
+check "le réseau du conteneur n'a que l'interface lo" lo \
+      "$($BOCAL run $IMG sh -c 'tail -n +3 /proc/net/dev | cut -d: -f1' |
+         tr -d ' ' | paste -sd, -)"
+
+if $BOCAL run $IMG ping -c 1 -W 1 127.0.0.1 >/dev/null 2>&1
+then joint=oui; else joint=non; fi
+check "lo est allumée : le conteneur peut se joindre lui-même" oui "$joint"
 
 echo
 echo "$pass réussi(s), $fail échec(s)"

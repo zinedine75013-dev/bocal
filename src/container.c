@@ -3,15 +3,16 @@
  *
  * Un conteneur n'est qu'un processus Linux ordinaire, lancé dans de
  * nouveaux "namespaces" : des vues privées sur certaines ressources du
- * système. Bocal en utilise trois :
+ * système. Bocal en utilise quatre :
  *
  *   CLONE_NEWPID  numéros de processus : le conteneur démarre au PID 1
  *   CLONE_NEWUTS  nom d'hôte : le conteneur peut changer le sien
  *   CLONE_NEWNS   points de montage : ce qu'il monte reste chez lui
+ *   CLONE_NEWNET  réseau : le conteneur n'a que sa propre interface lo
  *
  * Grâce à son namespace de montage, le conteneur peut ensuite changer de
  * racine : le dossier d'une image (Alpine) devient son "/", et il ne voit
- * plus aucun fichier de l'hôte.
+ * plus aucun fichier de l'hôte. Il reçoit aussi un /proc et un /dev à lui.
  *
  * Enfin, si on lui demande des limites (--memory, --cpus), le conteneur
  * est placé dans un cgroup avant même que sa commande démarre.
@@ -19,15 +20,20 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <net/if.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -50,9 +56,101 @@ static volatile sig_atomic_t container_pid;
 static volatile sig_atomic_t received_signal;
 
 /*
- * Fait du dossier de l'image la racine "/" du conteneur, puis lui monte un
- * /proc neuf. Appelée par l'enfant, déjà dans ses nouveaux namespaces.
+ * Crée un /dev minimal : un tmpfs (un système de fichiers en mémoire) avec
+ * les quelques fichiers spéciaux dont les programmes ont besoin. Le /dev
+ * de l'hôte, lui, donnerait accès à tous ses périphériques, disques compris.
  * Renvoie 0, ou -1 en cas d'erreur.
+ */
+static int setup_dev(void)
+{
+    if (mount("tmpfs", "/dev", "tmpfs", MS_NOSUID | MS_NOEXEC,
+              "mode=755") == -1) {
+        perror("bocal: mount /dev");
+        return -1;
+    }
+
+    /* Un fichier spécial désigne un pilote du noyau par deux numéros : le
+       majeur (le pilote) et le mineur (le périphérique). Par exemple, 1,3
+       est /dev/null, et 5,0 est /dev/tty, le terminal du processus. */
+    static const struct {
+        const char *path;
+        unsigned int major, minor;
+    } devices[] = {
+        { "/dev/null",    1, 3 },
+        { "/dev/zero",    1, 5 },
+        { "/dev/full",    1, 7 },
+        { "/dev/random",  1, 8 },
+        { "/dev/urandom", 1, 9 },
+        { "/dev/tty",     5, 0 },
+    };
+    for (size_t i = 0; i < sizeof devices / sizeof devices[0]; i++) {
+        /* mknod() crée le fichier spécial, mais applique le umask : le
+           chmod() qui suit donne les droits voulus (lecture et écriture
+           pour tous). */
+        if (mknod(devices[i].path, S_IFCHR | 0666,
+                  makedev(devices[i].major, devices[i].minor)) == -1 ||
+            chmod(devices[i].path, 0666) == -1) {
+            fprintf(stderr, "bocal: %s : %s\n", devices[i].path,
+                    strerror(errno));
+            return -1;
+        }
+    }
+
+    /* Raccourcis habituels vers les fichiers ouverts du processus. */
+    static const char *const links[][2] = {
+        { "/proc/self/fd",   "/dev/fd" },
+        { "/proc/self/fd/0", "/dev/stdin" },
+        { "/proc/self/fd/1", "/dev/stdout" },
+        { "/proc/self/fd/2", "/dev/stderr" },
+    };
+    for (size_t i = 0; i < sizeof links / sizeof links[0]; i++) {
+        if (symlink(links[i][0], links[i][1]) == -1) {
+            fprintf(stderr, "bocal: %s : %s\n", links[i][1],
+                    strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Allume l'interface réseau lo (127.0.0.1) du conteneur. Son namespace
+ * réseau est vide : lo est sa seule interface, et elle démarre éteinte.
+ * Le conteneur n'a donc accès ni au réseau de la machine, ni à Internet.
+ * Renvoie 0, ou -1 en cas d'erreur.
+ */
+static int setup_loopback(void)
+{
+    /* Les réglages d'une interface passent par ioctl() sur un socket
+       quelconque : SIOCGIFFLAGS lit ses drapeaux, SIOCSIFFLAGS les écrit. */
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd == -1) {
+        perror("bocal: socket");
+        return -1;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof ifr);
+    snprintf(ifr.ifr_name, sizeof ifr.ifr_name, "lo");
+
+    int ret = -1;
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) == -1) {
+        perror("bocal: ioctl SIOCGIFFLAGS");
+    } else {
+        ifr.ifr_flags |= IFF_UP;   /* le drapeau « allumée » */
+        if (ioctl(fd, SIOCSIFFLAGS, &ifr) == -1)
+            perror("bocal: ioctl SIOCSIFFLAGS");
+        else
+            ret = 0;
+    }
+    close(fd);
+    return ret;
+}
+
+/*
+ * Fait du dossier de l'image la racine "/" du conteneur, puis lui monte un
+ * /proc neuf et un /dev minimal. Appelée par l'enfant, déjà dans ses
+ * nouveaux namespaces. Renvoie 0, ou -1 en cas d'erreur.
  */
 static int enter_rootfs(const char *rootfs)
 {
@@ -107,7 +205,7 @@ static int enter_rootfs(const char *rootfs)
         return -1;
     }
 
-    return 0;
+    return setup_dev();
 }
 
 /*
@@ -151,6 +249,11 @@ static int child_main(void *arg)
         perror("bocal: sethostname");
         return 1;
     }
+
+    /* Grâce au namespace réseau, le conteneur a sa propre pile réseau,
+       vide : on allume juste son interface lo. */
+    if (setup_loopback() == -1)
+        return 1;
 
     /* Le dossier de l'image devient la racine du conteneur. */
     if (enter_rootfs(cfg->rootfs) == -1)
@@ -200,7 +303,8 @@ static pid_t start_child(struct child_args *args)
        les nouveaux namespaces demandés. La pile grandit vers le bas : on
        passe donc l'adresse de sa fin. SIGCHLD : on sera prévenu de la fin
        de l'enfant, comme avec fork(), ce qui permet d'utiliser waitpid(). */
-    int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
+    int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWNET |
+                SIGCHLD;
     pid_t pid = clone(child_main, stack + STACK_SIZE, flags, args);
     int err = errno;
 

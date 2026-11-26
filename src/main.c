@@ -20,7 +20,7 @@ static void usage(FILE *out)
         "Usage : bocal run [options] <image> <commande> [arguments...]\n"
         "\n"
         "Lance <commande> dans un conteneur isolé (nouveaux namespaces PID,\n"
-        "UTS et montage), dont la racine est le dossier <image>.\n"
+        "UTS, montage et réseau), dont la racine est le dossier <image>.\n"
         "Nécessite les droits root.\n"
         "\n"
         "Options :\n"

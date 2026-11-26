@@ -9,7 +9,8 @@ Un conteneur n'est pas une machine virtuelle : c'est un processus Linux ordinair
 - [x] Semaine 1 : isolation des processus (namespaces PID, UTS et montage)
 - [x] Semaine 2 : système de fichiers Alpine avec `pivot_root`, et un `/proc` propre au conteneur
 - [x] Semaine 3 : limites mémoire et CPU avec les cgroups v2
-- [ ] Semaine 4 : finitions et screencast
+- [x] Semaine 4 : `/dev` minimal, réseau isolé, tests et documentation
+- [ ] Screencast
 
 ## Prérequis
 
@@ -25,6 +26,8 @@ make test
 ```
 
 La première fois, `make test` télécharge l'image Alpine 3.24 (environ 3,5 Mo) dans le dossier `alpine/`, après avoir vérifié son empreinte SHA-512. On peut aussi la télécharger seule avec `make alpine`, et la retélécharger avec `sudo rm -rf alpine && make alpine`.
+
+Les 26 tests sont rangés par semaine. Certains vérifient l'effet réel des limites : un programme trop gourmand doit être tué, et un calcul limité à un quart de cœur doit être nettement ralenti.
 
 ## Utilisation
 
@@ -50,10 +53,13 @@ demo
 PID   USER     TIME  COMMAND
     1 root      0:00 /bin/sh
     4 root      0:00 ps
+/ # ping -c 1 1.1.1.1
+PING 1.1.1.1 (1.1.1.1): 56 data bytes
+ping: sendto: Network unreachable
 / # exit
 ```
 
-Le shell tourne dans Alpine, il est le PID 1 de son conteneur et ne voit aucun processus de la machine. Le nom d'hôte de la machine, lui, n'a pas changé.
+Le shell tourne dans Alpine, il est le PID 1 de son conteneur, ne voit aucun processus de la machine et n'a pas accès au réseau. Le nom d'hôte de la machine, lui, n'a pas changé.
 
 Avec une limite de mémoire, un programme trop gourmand est tué par le noyau :
 
@@ -74,6 +80,7 @@ $ echo $?
 | `CLONE_NEWPID` | sa propre numérotation des processus : il démarre au PID 1   |
 | `CLONE_NEWUTS` | son propre nom d'hôte                                        |
 | `CLONE_NEWNS`  | sa propre table de montages                                  |
+| `CLONE_NEWNET` | sa propre pile réseau, avec pour seule interface `lo`        |
 
 Ensuite, l'enfant :
 
@@ -81,8 +88,9 @@ Ensuite, l'enfant :
 2. attend que `bocal` l'ait placé dans son cgroup (voir plus bas) ;
 3. rend ses montages privés (`MS_PRIVATE`), sinon ce qu'il monte apparaîtrait aussi sur l'hôte ;
 4. change son nom d'hôte ;
-5. change de racine (voir ci-dessous) ;
-6. se remplace par la commande avec `execvp()`, qui conserve le PID 1.
+5. allume son interface `lo` (127.0.0.1) avec `ioctl()`. Son namespace réseau ne contient rien d'autre : il n'a accès ni au réseau de la machine, ni à Internet ;
+6. change de racine (voir ci-dessous) ;
+7. se remplace par la commande avec `execvp()`, qui conserve le PID 1.
 
 Le processus `bocal`, lui, attend la fin du conteneur avec `waitpid()` et renvoie son code de sortie.
 
@@ -93,7 +101,8 @@ L'image est un simple dossier qui contient un système Linux complet. Pour qu'el
 1. monte le dossier de l'image sur lui-même (*bind mount*), car `pivot_root()` exige que la nouvelle racine soit un point de montage ;
 2. appelle `pivot_root(".", ".")` : l'image devient la racine, et l'ancienne racine (celle de l'hôte) est empilée par-dessus ;
 3. décroche l'ancienne racine avec `umount2(".", MNT_DETACH)`, pour que plus aucun fichier de l'hôte ne soit accessible ;
-4. monte un `/proc` neuf. `ps` lit `/proc`, et un `/proc` monté depuis le conteneur ne montre que les processus de son namespace PID.
+4. monte un `/proc` neuf. `ps` lit `/proc`, et un `/proc` monté depuis le conteneur ne montre que les processus de son namespace PID ;
+5. crée un `/dev` minimal : un *tmpfs* (un système de fichiers en mémoire) où `mknod()` crée `null`, `zero`, `full`, `random`, `urandom` et `tty`, plus les raccourcis `/dev/fd`, `/dev/stdin`, `/dev/stdout` et `/dev/stderr`. Le `/dev` de l'hôte, lui, donnerait accès à tous ses périphériques, disques compris.
 
 Contrairement à `chroot()`, qui ne change que le point de départ des chemins, `pivot_root()` retire l'ancienne racine du namespace de montage : impossible d'en sortir en remontant les dossiers.
 
@@ -113,18 +122,34 @@ Un conteneur tué pour dépassement de mémoire reçoit `SIGKILL` : `bocal` renv
 
 ## Limites connues
 
-- Le conteneur travaille directement dans le dossier `alpine/` : un fichier supprimé dans le conteneur disparaît de l'image. Docker évite ça avec overlayfs, qui pose une couche modifiable propre à chaque conteneur sur une image en lecture seule.
-- `/dev` est vide dans le conteneur : il n'y a ni `/dev/null` ni `/dev/zero`. Les commandes qui en ont besoin échouent, par exemple une tâche de fond (`&`) dans un script `sh -c`.
-- Le conteneur partage le réseau de la machine, faute de namespace réseau.
+- Le conteneur est root, et c'est le vrai root de la machine : Bocal n'utilise pas de namespace utilisateur, ne retire aucune capacité et ne filtre pas les appels système. Il n'est donc pas fait pour lancer des programmes auxquels on ne fait pas confiance.
+- Le conteneur travaille directement dans le dossier `alpine/` : un fichier supprimé dans le conteneur disparaît de l'image.
+- Le conteneur n'a aucun accès au réseau.
 - Si `bocal` est tué avec `kill -9`, il ne peut pas supprimer son cgroup : un dossier `bocal-<PID>` vide reste alors dans `/sys/fs/cgroup`, et `sudo rmdir` le supprime. Le conteneur, lui, est bien arrêté.
+
+## Pour aller plus loin
+
+Ce que fait Docker et que Bocal ne fait pas :
+
+- **le réseau** : une paire d'interfaces virtuelles (*veth*) relie le conteneur à un pont (*bridge*) sur l'hôte, et du NAT lui donne accès à Internet ;
+- **le namespace utilisateur** : le conteneur est root chez lui, mais un simple utilisateur sur l'hôte (conteneurs *rootless*) ;
+- **les images en couches** : avec overlayfs, l'image reste en lecture seule et chaque conteneur écrit dans sa propre couche ;
+- **la sécurité** : retrait des capacités de root, et filtre `seccomp` qui bloque les appels système dangereux ;
+- **`docker exec`** : entrer dans un conteneur qui tourne déjà, avec `setns()`.
 
 ## Organisation du code
 
 ```
 src/main.c          ligne de commande (bocal run ...)
-src/container.c     création du conteneur : clone(), namespaces, pivot_root
+src/container.c     création du conteneur : clone(), namespaces, pivot_root, /dev, réseau
 src/cgroup.c        limites de ressources avec les cgroups v2
 src/*.h             interfaces entre ces fichiers
 scripts/alpine.sh   téléchargement de l'image Alpine (make alpine)
 tests/run.sh        tests automatiques (make test)
 ```
+
+## Ressources
+
+- Les pages de manuel ([man7.org](https://man7.org/linux/man-pages/)) : `clone(2)`, `namespaces(7)`, `pid_namespaces(7)`, `mount_namespaces(7)`, `pivot_root(2)`, `mknod(2)`, `netdevice(7)` et `cgroups(7)`.
+- La documentation du noyau sur les cgroups v2 : [Control Group v2](https://docs.kernel.org/admin-guide/cgroup-v2.html).
+- L'image utilisée : le *minirootfs* d'[Alpine Linux](https://alpinelinux.org/downloads/).
