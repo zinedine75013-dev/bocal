@@ -12,10 +12,16 @@
  * Grâce à son namespace de montage, le conteneur peut ensuite changer de
  * racine : le dossier d'une image (Alpine) devient son "/", et il ne voit
  * plus aucun fichier de l'hôte.
+ *
+ * Enfin, si on lui demande des limites (--memory, --cpus), le conteneur
+ * est placé dans un cgroup avant même que sa commande démarre.
  */
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -25,10 +31,23 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "cgroup.h"
 #include "container.h"
 
 /* Taille de la pile du processus enfant : clone() ne la crée pas pour nous. */
 #define STACK_SIZE (1024 * 1024)
+
+/* Ce que le parent transmet à l'enfant. */
+struct child_args {
+    const struct container_config *cfg;
+    int sync[2];   /* tube de synchronisation : [0] lecture, [1] écriture */
+};
+
+/* Variables partagées avec le gestionnaire de signal on_signal(). Le type
+   volatile sig_atomic_t garantit qu'il les lit et les écrit correctement,
+   même s'il interrompt le programme à n'importe quel moment. */
+static volatile sig_atomic_t container_pid;
+static volatile sig_atomic_t received_signal;
 
 /*
  * Fait du dossier de l'image la racine "/" du conteneur, puis lui monte un
@@ -98,14 +117,25 @@ static int enter_rootfs(const char *rootfs)
  */
 static int child_main(void *arg)
 {
-    const struct container_config *cfg = arg;
+    struct child_args *args = arg;
+    const struct container_config *cfg = args->cfg;
 
-    /* Si bocal meurt (Ctrl+C, kill...), le noyau tue aussi le conteneur :
-       il ne doit jamais lui survivre en tâche de fond. */
+    /* Si bocal est tué brutalement (kill -9), le noyau tue aussi le
+       conteneur : il ne doit jamais lui survivre en tâche de fond. */
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1) {
         perror("bocal: prctl");
         return 1;
     }
+
+    /* On attend le feu vert du parent, qui doit d'abord nous placer dans
+       notre cgroup : la commande ne doit pas démarrer sans ses limites.
+       On ferme d'abord notre copie de l'extrémité d'écriture. Sinon, si
+       le parent abandonnait, read() attendrait pour toujours. */
+    close(args->sync[1]);
+    char go;
+    if (read(args->sync[0], &go, 1) != 1)
+        return 1;   /* tube fermé sans feu vert : le parent a abandonné */
+    close(args->sync[0]);
 
     /* Le nouveau namespace de montage est une copie de celui de l'hôte.
        Sur la plupart des distributions (systemd), ces montages sont
@@ -139,7 +169,24 @@ static int child_main(void *arg)
     return err == ENOENT ? 127 : 126;
 }
 
-int container_run(const struct container_config *cfg)
+/*
+ * Appelée quand bocal reçoit SIGINT (Ctrl+C), SIGTERM ou SIGHUP. Le PID 1
+ * du conteneur ignorerait ces signaux : on le tue donc avec SIGKILL.
+ * bocal, lui, continue, ce qui lui laisse le temps de supprimer le cgroup.
+ */
+static void on_signal(int sig)
+{
+    received_signal = sig;
+    /* Garde-fou : kill(0) ou kill(-1) viseraient bien d'autres processus. */
+    if (container_pid > 0)
+        kill(container_pid, SIGKILL);
+}
+
+/*
+ * Crée l'enfant avec clone(), dans de nouveaux namespaces. Renvoie son
+ * PID (vu de l'hôte), ou -1 en cas d'erreur.
+ */
+static pid_t start_child(struct child_args *args)
 {
     /* La pile de l'enfant : une zone mémoire que l'on réserve nous-mêmes. */
     char *stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
@@ -154,32 +201,105 @@ int container_run(const struct container_config *cfg)
        passe donc l'adresse de sa fin. SIGCHLD : on sera prévenu de la fin
        de l'enfant, comme avec fork(), ce qui permet d'utiliser waitpid(). */
     int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
-    pid_t pid = clone(child_main, stack + STACK_SIZE, flags, (void *)cfg);
+    pid_t pid = clone(child_main, stack + STACK_SIZE, flags, args);
+    int err = errno;
+
+    /* Sans CLONE_VM, l'enfant a sa propre copie de la mémoire, pile
+       comprise : le parent peut libérer la sienne tout de suite. */
+    munmap(stack, STACK_SIZE);
+
     if (pid == -1) {
-        int err = errno;
-        perror("bocal: clone");
+        fprintf(stderr, "bocal: clone: %s\n", strerror(err));
         if (err == EPERM)
             fprintf(stderr, "bocal: il faut être root pour créer des "
                             "namespaces, relance la commande avec sudo\n");
-        munmap(stack, STACK_SIZE);
+    }
+    return pid;
+}
+
+/*
+ * Lance le conteneur, le place dans son cgroup (s'il en a un), puis
+ * attend qu'il se termine. Renvoie comme container_run().
+ */
+static int run_child(const struct container_config *cfg, const char *cgroup)
+{
+    struct child_args args = { .cfg = cfg };
+
+    /* Le tube de synchronisation. O_CLOEXEC : il se fermera tout seul au
+       moment d'execvp(), la commande n'en hérite pas. */
+    if (pipe2(args.sync, O_CLOEXEC) == -1) {
+        perror("bocal: pipe2");
         return -1;
     }
 
-    /* Vu de l'hôte, le conteneur a un PID ordinaire (pid). Vu de
-       l'intérieur, c'est le PID 1. On attend qu'il se termine. */
-    int status;
-    while (waitpid(pid, &status, 0) == -1) {
-        if (errno != EINTR) {
-            perror("bocal: waitpid");
-            munmap(stack, STACK_SIZE);
-            return -1;
-        }
+    pid_t pid = start_child(&args);
+    if (pid == -1) {
+        close(args.sync[0]);
+        close(args.sync[1]);
+        return -1;
     }
-    munmap(stack, STACK_SIZE);
 
+    /* Le conteneur entre dans son cgroup, puis on lui donne le feu vert
+       en écrivant un octet dans le tube. En cas d'échec, on ferme le tube
+       sans rien écrire : l'enfant abandonne. */
+    bool ok = (cgroup == NULL || cgroup_add(cgroup, pid) == 0) &&
+              write(args.sync[1], "x", 1) == 1;
+
+    /* On ne ferme notre extrémité de lecture qu'après avoir écrit : tant
+       qu'elle est ouverte, write() ne peut pas déclencher SIGPIPE (qui
+       tuerait bocal), même si l'enfant était déjà mort. */
+    close(args.sync[0]);
+    close(args.sync[1]);
+
+    /* Ctrl+C ou kill sur bocal : on arrête le conteneur (voir on_signal). */
+    container_pid = pid;
+    struct sigaction sa = { .sa_handler = on_signal };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
+    /* Vu de l'hôte, le conteneur a un PID ordinaire (pid). Vu de
+       l'intérieur, c'est le PID 1. On attend qu'il se termine ; si un
+       signal interrompt l'attente (EINTR), on la reprend. */
+    int status;
+    pid_t w;
+    do {
+        w = waitpid(pid, &status, 0);
+    } while (w == -1 && errno == EINTR);
+
+    /* Le conteneur est mort : son PID peut désormais être réutilisé par
+       un autre processus, le gestionnaire de signal doit l'oublier. */
+    container_pid = 0;
+
+    if (w == -1) {
+        perror("bocal: waitpid");
+        return -1;
+    }
+    if (!ok)
+        return -1;
+    if (received_signal)
+        return 128 + received_signal;
     if (WIFEXITED(status))
         return WEXITSTATUS(status);
     if (WIFSIGNALED(status))
         return 128 + WTERMSIG(status);
     return -1;
+}
+
+int container_run(const struct container_config *cfg)
+{
+    /* Le cgroup n'est créé que si une limite est demandée. */
+    char cgroup[PATH_MAX];
+    bool limited = cfg->memory > 0 || cfg->cpus > 0;
+    if (limited &&
+        cgroup_create(cgroup, sizeof cgroup, cfg->memory, cfg->cpus) == -1)
+        return -1;
+
+    int ret = run_child(cfg, limited ? cgroup : NULL);
+
+    /* Le conteneur est terminé, son cgroup est vide : on le supprime. */
+    if (limited)
+        cgroup_remove(cgroup);
+    return ret;
 }

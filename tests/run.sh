@@ -74,5 +74,57 @@ check "ps ne voit que les processus du conteneur" \
       1 "$($BOCAL run $IMG ps | tail -n +2 | wc -l)"
 
 echo
+echo "Semaine 3 : limites avec les cgroups v2"
+
+$BOCAL run --memory 64X $IMG true 2>/dev/null
+check "--memory refuse une taille invalide" 2 "$?"
+
+$BOCAL run --cpus 0 $IMG true 2>/dev/null
+check "--cpus refuse un nombre de cœurs invalide" 2 "$?"
+
+# /proc/self/cgroup donne le cgroup du processus qui le lit : la commande
+# doit être dans le sien dès son démarrage.
+if $BOCAL run --memory 64M $IMG cat /proc/self/cgroup | grep -q '^0::/bocal-'
+then dedans=oui; else dedans=non; fi
+check "la commande démarre déjà dans son cgroup" oui "$dedans"
+
+# Pendant que le conteneur tourne, on lit ses limites depuis l'hôte. Son
+# cgroup porte le PID de bocal, lancé en arrière-plan ($!).
+$BOCAL run --memory 64M --cpus 0.5 $IMG sleep 2 &
+cg=/sys/fs/cgroup/bocal-$!
+sleep 1
+check "--memory 64M : memory.max vaut 67108864 octets (64 × 1024 × 1024)" \
+      67108864 "$(cat "$cg/memory.max" 2>/dev/null)"
+check "--cpus 0.5 : cpu.max vaut « 50000 100000 »" \
+      "50000 100000" "$(cat "$cg/cpu.max" 2>/dev/null)"
+wait
+if [ -d "$cg" ]; then reste=oui; else reste=non; fi
+check "le cgroup est supprimé à la fin du conteneur" non "$reste"
+
+# Une chaîne qui double de taille à chaque tour dépasse vite la limite :
+# le noyau tue alors le programme avec SIGKILL, d'où le code 128 + 9.
+# Sans limite, la boucle s'arrêterait d'elle-même à 256 Mo.
+GOURMAND='x=a; while [ ${#x} -lt 268435456 ]; do x=$x$x; done'
+$BOCAL run --memory 32M $IMG sh -c "$GOURMAND"
+check "--memory 32M : un programme trop gourmand est tué (code 137)" 137 "$?"
+
+$BOCAL run --memory 32M $IMG true
+check "--memory 32M : une commande légère fonctionne" 0 "$?"
+
+# Le même calcul, sans limite puis avec un quart de cœur : il doit être
+# nettement plus lent (environ 4 fois).
+CALCUL='i=0; while [ $i -lt 300000 ]; do i=$((i + 1)); done'
+t0=$(date +%s%N)
+$BOCAL run $IMG sh -c "$CALCUL"
+t1=$(date +%s%N)
+$BOCAL run --cpus 0.25 $IMG sh -c "$CALCUL"
+t2=$(date +%s%N)
+libre=$(( (t1 - t0) / 1000000 ))
+limite=$(( (t2 - t1) / 1000000 ))
+if [ "$limite" -gt $((2 * libre)) ]; then ralenti=oui; else ralenti=non; fi
+check "--cpus 0.25 : le même calcul est plus lent ($libre ms, puis $limite ms)" \
+      oui "$ralenti"
+
+echo
 echo "$pass réussi(s), $fail échec(s)"
 [ "$fail" -eq 0 ]

@@ -3,9 +3,11 @@
 
 /* Tout ce qu'il faut savoir pour lancer un conteneur. */
 struct container_config {
-    const char *rootfs;    /* dossier de l'image, qui deviendra la racine "/" */
-    const char *hostname;  /* nom d'hôte vu depuis le conteneur */
-    char **argv;           /* commande à lancer, terminée par NULL */
+    const char *rootfs;        /* dossier de l'image, qui deviendra "/" */
+    const char *hostname;      /* nom d'hôte vu depuis le conteneur */
+    unsigned long long memory; /* mémoire maximale en octets (0 : sans limite) */
+    double cpus;               /* nombre de cœurs maximal (0 : sans limite) */
+    char **argv;               /* commande à lancer, terminée par NULL */
 };
 
 /*
