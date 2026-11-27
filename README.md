@@ -4,14 +4,6 @@ Un moteur de conteneurs minimal écrit en C, pour comprendre ce que fait Docker 
 
 Un conteneur n'est pas une machine virtuelle : c'est un processus Linux ordinaire que le noyau isole (namespaces) et limite (cgroups). Bocal utilise directement ces mécanismes, avec les appels système de Linux et sans aucune dépendance.
 
-## Avancement
-
-- [x] Semaine 1 : isolation des processus (namespaces PID, UTS et montage)
-- [x] Semaine 2 : système de fichiers Alpine avec `pivot_root`, et un `/proc` propre au conteneur
-- [x] Semaine 3 : limites mémoire et CPU avec les cgroups v2
-- [x] Semaine 4 : `/dev` minimal, réseau isolé, tests et documentation
-- [ ] Screencast
-
 ## Prérequis
 
 - Linux, avec les droits root (`sudo`). Sous Windows, WSL2 convient ; sous macOS, il faut une machine virtuelle Linux.
